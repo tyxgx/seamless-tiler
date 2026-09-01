@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+*.log
+output/
+final_xx/
+final_xx.zip
+seamless/
+input/
+MEMORY.md
+.DS_Store
