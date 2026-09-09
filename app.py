@@ -14,7 +14,7 @@ import io
 import streamlit as st
 from PIL import Image
 
-from seamless_tiler import tile_preview
+from seamless_tiler import make_seamless, tile_preview
 from generative_seamless import make_seamless_generative
 from suitability import analyze, auto_crop_for_tiling
 from blend_quality import auto_style_prompt
@@ -31,13 +31,23 @@ if uploaded is not None:
     if not report["is_pattern_like"]:
         img, _crop_box, _notes = auto_crop_for_tiling(img, report)
 
+    method = st.radio(
+        "Method", ["Generative (best quality, ~5-15 min, random each time)",
+                    "Classical (instant, free, same result every time)"],
+        horizontal=True,
+    )
+    is_generative = method.startswith("Generative")
+
     generate = st.button("Generate", type="primary")
 
     if generate:
-        with st.spinner("Generating..."):
-            prompt = auto_style_prompt(img)
+        with st.spinner("Generating..." if is_generative else "Processing..."):
             try:
-                tile = make_seamless_generative(img, prompt, band_ratio=0.12, guidance=30)
+                if is_generative:
+                    prompt = auto_style_prompt(img)
+                    tile = make_seamless_generative(img, prompt, band_ratio=0.12, guidance=30)
+                else:
+                    tile = make_seamless(img, blend_ratio=0.10, method="seamcut")
             except Exception as e:
                 st.error(f"Generation failed: {e}")
                 st.stop()
