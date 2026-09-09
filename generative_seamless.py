@@ -41,6 +41,8 @@ import requests
 from PIL import Image, ImageDraw, ImageFilter
 
 from seamless_tiler import tile_preview
+from suitability import analyze, auto_crop_for_tiling, print_report
+from blend_quality import auto_style_prompt
 
 REPLICATE_API = "https://api.replicate.com/v1"
 
@@ -161,12 +163,65 @@ def run_flux_fill(image: Image.Image, mask: Image.Image, prompt: str,
     return Image.open(io.BytesIO(img_resp.content)).convert("RGB")
 
 
+def auto_fix_artifacts(mask: Image.Image, result: Image.Image,
+                        model: str = "black-forest-labs/flux-fill-dev",
+                        guidance: float = 30, max_retries: int = 2) -> Image.Image:
+    """After the main fill, automatically look for a visible artifact blob
+    (see blend_quality.detect_artifact_blob — an anomalously saturated or
+    anomalously flat patch relative to its own surroundings) and, if found,
+    re-inpaint just that local region with a prompt built from its own
+    immediate surroundings, up to max_retries times.
+
+    This automates the manual "spot-fix" workflow that fixed a real bold
+    orange-splash artifact by hand (detect the bad region -> build a small
+    local mask -> re-inpaint with a prompt describing just the surrounding
+    colors) so it happens automatically on every run instead of requiring a
+    human to notice and fix it. See project MEMORY.md for the failure this
+    was built from.
+    """
+    from blend_quality import detect_artifact_blob, local_patch_prompt
+
+    current = result
+    mask_arr = np.asarray(mask) > 127
+    for attempt in range(max_retries):
+        bbox = detect_artifact_blob(current, mask)
+        if bbox is None:
+            break
+        x0, y0, x1, y1 = bbox
+        print(f"  -> artifact detected at {bbox}, auto-fixing "
+              f"(attempt {attempt + 1}/{max_retries})...")
+
+        local_mask_img = Image.new("L", current.size, 0)
+        ImageDraw.Draw(local_mask_img).rectangle([x0, y0, x1, y1], fill=255)
+        # never let the local fix stray outside the original healing band —
+        # keeps the tile-repeat edge guarantee intact
+        local_arr = (np.asarray(local_mask_img) > 127) & mask_arr
+        if not local_arr.any():
+            break
+        local_mask_img = Image.fromarray((local_arr * 255).astype(np.uint8))
+
+        prompt = local_patch_prompt(current, bbox)
+        fill = run_flux_fill(current, local_mask_img, prompt, model=model, guidance=guidance)
+        if fill.size != current.size:
+            fill = fill.resize(current.size, Image.LANCZOS)
+
+        composite_mask = local_mask_img.filter(ImageFilter.GaussianBlur(radius=3))
+        cur_arr = np.asarray(current).astype(np.float32)
+        fill_arr = np.asarray(fill).astype(np.float32)
+        alpha = (np.asarray(composite_mask).astype(np.float32) / 255.0)[:, :, None]
+        current = Image.fromarray(np.clip(
+            cur_arr * (1 - alpha) + fill_arr * alpha, 0, 255).astype(np.uint8))
+
+    return current
+
+
 def make_seamless_generative(img: Image.Image, prompt: str,
                               band_ratio: float = 0.12,
                               model: str = "black-forest-labs/flux-fill-dev",
                               seed: int = None, guidance: float = 30,
                               feather: int = 0,
-                              composite_feather: int = 2) -> Image.Image:
+                              composite_feather: int = 2,
+                              auto_fix: bool = True) -> Image.Image:
     """Generate the fill, then COMPOSITE it back onto the original shifted
     image — only keep the model's pixels strictly inside the mask, restore
     the exact original pixels everywhere else.
@@ -202,17 +257,35 @@ def make_seamless_generative(img: Image.Image, prompt: str,
     result_arr = np.asarray(result).astype(np.float32)
     alpha = (np.asarray(composite_mask).astype(np.float32) / 255.0)[:, :, None]
     composited = shifted_arr * (1 - alpha) + result_arr * alpha
-    return Image.fromarray(np.clip(composited, 0, 255).astype(np.uint8))
+    composited_img = Image.fromarray(np.clip(composited, 0, 255).astype(np.uint8))
+
+    if auto_fix:
+        composited_img = auto_fix_artifacts(mask, composited_img, model=model,
+                                             guidance=guidance)
+    return composited_img
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("input", type=Path)
     ap.add_argument("output", type=Path)
-    ap.add_argument("--prompt", required=True,
+    ap.add_argument("--prompt", default=None,
                      help="describe the pattern's style/colors/motifs so the "
-                          "model fills the seam with matching new content")
-    ap.add_argument("--band", type=float, default=0.12)
+                          "model fills the seam with matching new content. "
+                          "If omitted, a prompt is auto-generated from the "
+                          "image's own dominant colors (see blend_quality.py)")
+    ap.add_argument("--band", type=float, default=0.12,
+                     help="healing band as fraction of size (default 0.12). "
+                          "A wider band was tried as an automatic fix for "
+                          "scene-like inputs but made things WORSE, not "
+                          "better — more area for the model to fill means "
+                          "more chance of a bad flat/hazy hallucination "
+                          "(confirmed: 0.25 produced a large flat patch "
+                          "where 0.12 hadn't — see project MEMORY.md). Keep "
+                          "the default; if you see a visible internal seam "
+                          "just outside the band, that's random-seed "
+                          "variance — retry (see --candidates) rather than "
+                          "widening the band.")
     ap.add_argument("--model", default="black-forest-labs/flux-fill-dev")
     ap.add_argument("--guidance", type=float, default=30)
     ap.add_argument("--feather", type=int, default=0,
@@ -226,28 +299,80 @@ def main():
     ap.add_argument("--compare", action="store_true")
     ap.add_argument("--tile-cols", type=int, default=3)
     ap.add_argument("--tile-rows", type=int, default=3)
+    ap.add_argument("--auto-crop", dest="auto_crop", action="store_true", default=True,
+                     help="(default on) if the input isn't pattern-like — a "
+                          "directional scene or one with a dominant focal "
+                          "object — automatically crop to the most tileable "
+                          "square sub-region before running the pipeline, "
+                          "instead of silently producing a bad seamless tile")
+    ap.add_argument("--no-auto-crop", dest="auto_crop", action="store_false",
+                     help="disable the suitability check / auto-crop and "
+                          "always run on the input as given")
+    ap.add_argument("--candidates", type=int, default=1,
+                     help="generate this many candidates with different "
+                          "random seeds and save all of them (labeled "
+                          "_candidateN), instead of just one. There is NO "
+                          "reliable automatic way to pick the single best one "
+                          "(tested and dropped — see blend_quality.py's "
+                          "docstring/project MEMORY.md) — review the "
+                          "candidates yourself and keep the best.")
     args = ap.parse_args()
 
     img = Image.open(args.input)
-    print(f"generating seamless fill for {args.input} via {args.model} "
-          f"(guidance={args.guidance})...")
-    result = make_seamless_generative(
-        img, args.prompt, band_ratio=args.band, model=args.model,
-        seed=args.seed, guidance=args.guidance, feather=args.feather,
-        composite_feather=args.composite_feather)
-    result.save(args.output)
-    print(f"seamless tile written: {args.output}")
 
-    if args.compare:
-        preview_path = args.output.with_name(args.output.stem + "_preview.png")
-        seamless_grid = tile_preview(result, args.tile_cols, args.tile_rows)
-        original_grid = tile_preview(img.convert("RGB"), args.tile_cols, args.tile_rows)
-        w, h = original_grid.size
-        combo = Image.new("RGB", (w, h * 2 + 10), "white")
-        combo.paste(original_grid, (0, 0))
-        combo.paste(seamless_grid, (0, h + 10))
-        combo.save(preview_path)
-        print(f"tiled preview written: {preview_path}")
+    report = analyze(img)
+    print_report(report, label=str(args.input))
+    if not report["is_pattern_like"] and args.auto_crop:
+        img, crop_box, notes = auto_crop_for_tiling(img, report)
+        for note in notes:
+            print(f"  -> {note}")
+        autocrop_path = args.output.with_name(args.output.stem + "_autocrop_source.png")
+        img.save(autocrop_path)
+        print(f"  -> auto-crop source saved: {autocrop_path}")
+    elif not report["is_pattern_like"]:
+        print("  -> --no-auto-crop set: proceeding on the full input anyway "
+              "(result may show a visible repeat/duplication artifact)")
+
+    band = args.band
+
+    prompt = args.prompt
+    if prompt is None:
+        prompt = auto_style_prompt(img)
+        print(f"  -> no --prompt given, auto-generated from dominant colors: "
+              f"{prompt!r}")
+
+    n = max(1, args.candidates)
+    for i in range(n):
+        seed = args.seed
+        if n > 1 and seed is None:
+            seed = 1000 + i  # deterministic-but-distinct seeds across candidates
+        out_path = args.output if n == 1 else args.output.with_name(
+            f"{args.output.stem}_candidate{i+1}{args.output.suffix}")
+
+        print(f"generating seamless fill ({i+1}/{n}, seed={seed}) for "
+              f"{args.input} via {args.model} (guidance={args.guidance})...")
+        result = make_seamless_generative(
+            img, prompt, band_ratio=band, model=args.model,
+            seed=seed, guidance=args.guidance, feather=args.feather,
+            composite_feather=args.composite_feather)
+        result.save(out_path)
+        print(f"seamless tile written: {out_path}")
+
+        if args.compare:
+            preview_path = out_path.with_name(out_path.stem + "_preview.png")
+            seamless_grid = tile_preview(result, args.tile_cols, args.tile_rows)
+            original_grid = tile_preview(img.convert("RGB"), args.tile_cols, args.tile_rows)
+            w, h = original_grid.size
+            combo = Image.new("RGB", (w, h * 2 + 10), "white")
+            combo.paste(original_grid, (0, 0))
+            combo.paste(seamless_grid, (0, h + 10))
+            combo.save(preview_path)
+            print(f"tiled preview written: {preview_path}")
+
+    if n > 1:
+        print(f"-> {n} candidates written ({args.output.stem}_candidate1..{n}"
+              f"{args.output.suffix}) — review them and keep the best; no "
+              "automatic picker is applied (see note above).")
 
 
 if __name__ == "__main__":

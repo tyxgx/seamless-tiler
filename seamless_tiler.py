@@ -41,6 +41,9 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+# NOTE: suitability.py imports measure_seam_tileability from this module, so
+# the reverse import is done lazily inside main() below to avoid a circular
+# import at module load time.
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +232,47 @@ def make_seamless(img: Image.Image, blend_ratio: float = 0.10,
     return Image.fromarray(healed)
 
 
+def measure_seam_tileability(img: Image.Image, blend_ratio: float = 0.12) -> dict:
+    """Run the offset step and measure how good the BEST available seam-cut
+    actually is — without committing to any masking/generation — by reusing
+    the real seamcut cost map and dynamic-program path from
+    _heal_seam_*_seamcut above.
+
+    Returns the average per-row cost along the lowest-cost path, for both
+    the horizontal and vertical center bands. This is a measured signal, not
+    a guess: a LOW cost means the DP found rows where the band and its
+    mirror already agree closely (a natural place to hide the cut — typical
+    of an all-over repeating motif). A HIGH cost means original and mirror
+    disagree badly along the *entire* band, i.e. there's nowhere to hide the
+    cut — typical of a single dominant/unique object or a directional
+    (sky-above/ground-below) composition, where no cut path can avoid
+    crossing something that reads as an obvious duplicate. See
+    suitability.py, which uses this as its primary "is this tileable"
+    signal.
+    """
+    arr = np.asarray(img.convert("RGB")).astype(np.float32)
+    h, w = arr.shape[:2]
+    shifted = np.roll(arr, shift=(h // 2, w // 2), axis=(0, 1))
+
+    def band_cost(region_arr: np.ndarray) -> float:
+        hh, ww = region_arr.shape[:2]
+        band = max(2, int(ww * blend_ratio))
+        cx = ww // 2
+        lo, hi = max(0, cx - band), min(ww, cx + band)
+        region = region_arr[:, lo:hi]
+        mirrored = region[:, ::-1]
+        color_diff = np.sum((region - mirrored) ** 2, axis=2)
+        gmag = _gradient_magnitude(region) + _gradient_magnitude(mirrored)
+        cost = color_diff / (gmag + 25.0)
+        path = _min_cost_vertical_path(cost)
+        total = cost[np.arange(hh), path].sum()
+        return float(total / hh)
+
+    h_cost = band_cost(shifted)
+    v_cost = band_cost(np.transpose(shifted, (1, 0, 2)))
+    return {"horizontal_cost": h_cost, "vertical_cost": v_cost}
+
+
 def tile_preview(tile: Image.Image, cols: int = 3, rows: int = 3) -> Image.Image:
     """Repeat `tile` in a cols x rows grid so seams (if any) become visible."""
     w, h = tile.size
@@ -240,6 +284,8 @@ def tile_preview(tile: Image.Image, cols: int = 3, rows: int = 3) -> Image.Image
 
 
 def main():
+    from suitability import analyze, auto_crop_for_tiling, print_report
+
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("input", type=Path, help="input pattern/photo")
     ap.add_argument("output", type=Path, help="output seamless tile (png)")
@@ -256,9 +302,28 @@ def main():
     ap.add_argument("--compare", action="store_true",
                      help="also write an ORIGINAL-tiled preview next to the "
                           "seamless one, for a clear before/after")
+    ap.add_argument("--auto-crop", dest="auto_crop", action="store_true", default=True,
+                     help="(default on) if the input isn't pattern-like — a "
+                          "directional scene or one with a dominant focal "
+                          "object — automatically crop to the most tileable "
+                          "square sub-region first (see suitability.py)")
+    ap.add_argument("--no-auto-crop", dest="auto_crop", action="store_false",
+                     help="disable the suitability check / auto-crop and "
+                          "always run on the input as given")
     args = ap.parse_args()
 
     img = Image.open(args.input)
+
+    report = analyze(img)
+    print_report(report, label=str(args.input))
+    if not report["is_pattern_like"] and args.auto_crop:
+        img, crop_box, notes = auto_crop_for_tiling(img, report)
+        for note in notes:
+            print(f"  -> {note}")
+    elif not report["is_pattern_like"]:
+        print("  -> --no-auto-crop set: proceeding on the full input anyway "
+              "(result may show a visible repeat/duplication artifact)")
+
     tile = make_seamless(img, blend_ratio=args.blend, method=args.method)
     tile.save(args.output)
     print(f"seamless tile written ({args.method}): {args.output}")
